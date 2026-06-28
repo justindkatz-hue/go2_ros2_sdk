@@ -48,12 +48,12 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
                 on_message=self._on_data_channel_message,
                 on_video_frame=self.on_video_frame_callback if self.config.enable_video else None,
                 decode_lidar=self.config.decode_lidar,
+                aes_key=self.config.aes_key,
             )
             
             self.connections[robot_id] = conn
             await conn.connect()
-            await conn.disableTrafficSaving(True)
-            
+
             logger.info(f"Connected to robot {robot_id} at {robot_ip}")
             
         except Exception as e:
@@ -176,10 +176,15 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         """Callback after connection validation"""
         try:
             if robot_id in self.connections:
+                conn = self.connections[robot_id]
                 for topic in RTC_TOPIC.values():
-                    self.connections[robot_id].data_channel.send(
+                    conn.data_channel.send(
                         json.dumps({"type": "subscribe", "topic": topic}))
-            
+                # The data channel is confirmed open here (validation just succeeded on it).
+                # disableTrafficSaving must be sent after the channel is open; calling it
+                # from connect() races against ICE and silently no-ops every time.
+                asyncio.ensure_future(conn.disableTrafficSaving(True))
+
             if self.on_validated_callback:
                 self.on_validated_callback(robot_id)
                 

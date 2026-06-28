@@ -79,6 +79,7 @@ class Go2DriverNode(Node):
         robot_ip = os.getenv('ROBOT_IP', os.getenv('GO2_IP', ''))
         token = os.getenv('ROBOT_TOKEN', os.getenv('GO2_TOKEN', ''))
         conn_type = os.getenv('CONN_TYPE', '')
+        aes_key = os.getenv('ROBOT_AES_KEY', '')
 
         # Declare parameters
         self.declare_parameters(
@@ -87,6 +88,7 @@ class Go2DriverNode(Node):
                 ('robot_ip', robot_ip),
                 ('token', token),
                 ('conn_type', conn_type),
+                ('aes_key', aes_key),
                 ('enable_video', True),
                 ('decode_lidar', True),
                 ('publish_raw_voxel', False),
@@ -101,6 +103,7 @@ class Go2DriverNode(Node):
             robot_ip=self.get_parameter('robot_ip').get_parameter_value().string_value,
             token=self.get_parameter('token').get_parameter_value().string_value,
             conn_type=self.get_parameter('conn_type').get_parameter_value().string_value,
+            aes_key=self.get_parameter('aes_key').get_parameter_value().string_value,
             enable_video=self.get_parameter('enable_video').get_parameter_value().bool_value,
             decode_lidar=self.get_parameter('decode_lidar').get_parameter_value().bool_value,
             publish_raw_voxel=self.get_parameter('publish_raw_voxel').get_parameter_value().bool_value,

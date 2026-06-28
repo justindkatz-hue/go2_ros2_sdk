@@ -42,6 +42,7 @@ class Go2Connection:
         on_open: Optional[Callable] = None,
         on_video_frame: Optional[Callable] = None,
         decode_lidar: bool = True,
+        aes_key: str = "",
     ):
         self.pc = RTCPeerConnection()
         self.robot_ip = robot_ip
@@ -56,6 +57,7 @@ class Go2Connection:
         self.on_open = on_open
         self.on_video_frame = on_video_frame
         self.decode_lidar = decode_lidar
+        self.aes_key = aes_key
         
         # Initialize components
         self.http_client = HttpClient(timeout=10.0)
@@ -208,19 +210,38 @@ class Go2Connection:
             logger.error(f"Failed to set traffic saving: {e}")
             return False
 
-    #decrypt RSA key from firmware version >=1.1.8
-    def decrypt_con_notify_data(self, encrypted_b64: str) -> str:
-        key = bytes([232, 86, 130, 189, 22, 84, 155, 0, 142, 4, 166, 104, 43, 179, 235, 227])
+    def _gcm_decrypt(self, key_bytes: bytes, encrypted_b64: str) -> str:
         data = base64.b64decode(encrypted_b64)
         if len(data) < 28:
             raise ValueError("Decryption failed: input data too short")
         tag = data[-16:]
         nonce = data[-28:-16]
         ciphertext = data[:-28]
-        
-        aesgcm = AESGCM(key) 
-        plaintext = aesgcm.decrypt(nonce, ciphertext + tag, None)
+        plaintext = AESGCM(key_bytes).decrypt(nonce, ciphertext + tag, None)
         return plaintext.decode('utf-8')
+
+    def decrypt_con_notify_data(self, encrypted_b64: str) -> str:
+        # data2 == 2: shared static key (firmware 1.1.8 – 1.1.14)
+        key = bytes([232, 86, 130, 189, 22, 84, 155, 0, 142, 4, 166, 104, 43, 179, 235, 227])
+        return self._gcm_decrypt(key, encrypted_b64)
+
+    def decrypt_con_notify_data_v3(self, encrypted_b64: str) -> str:
+        # data2 == 3: per-device key (firmware >= 1.1.15)
+        if not self.aes_key:
+            raise Go2ConnectionError(
+                "Firmware 1.1.15+ requires a per-device AES-128 key (data2=3). "
+                "Fetch it with: unitree-fetch-aes-key --email <email> --device-type Go2 "
+                "then set ROBOT_AES_KEY=<32-hex-chars> in your environment."
+            )
+        try:
+            key = bytes.fromhex(self.aes_key.strip())
+        except ValueError as e:
+            raise Go2ConnectionError(f"ROBOT_AES_KEY is not valid hex: {e}") from e
+        if len(key) != 16:
+            raise Go2ConnectionError(
+                f"ROBOT_AES_KEY must be 16 bytes (32 hex chars), got {len(key)}"
+            )
+        return self._gcm_decrypt(key, encrypted_b64)
 	 
 
     async def connect(self) -> None:
@@ -260,6 +281,9 @@ class Go2Connection:
 
                 if data2 == 2:
                     data1 = self.decrypt_con_notify_data(data1)
+                elif data2 == 3:
+                    data1 = self.decrypt_con_notify_data_v3(data1)
+                # data2 == 1 or absent: data1 is plaintext (old firmware)
                 # Extract the public key from 'data1'
                 public_key_pem = data1[10:len(data1)-10]
                 path_ending = PathCalculator.calc_local_path_ending(data1)
