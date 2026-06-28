@@ -14,6 +14,8 @@ from ...domain.constants import ROBOT_CMD, RTC_TOPIC
 
 logger = logging.getLogger(__name__)
 
+_RECONNECT_DELAYS = [2, 4, 8, 16, 30]  # seconds between attempts
+
 
 class WebRTCAdapter(IRobotDataReceiver, IRobotController):
     """WebRTC adapter for robot communication"""
@@ -25,6 +27,7 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         self.webrtc_msgs = asyncio.Queue()
         self.on_validated_callback = on_validated_callback
         self.on_video_frame_callback = on_video_frame_callback
+        self._reconnecting: set = set()  # robot_ids with a reconnect in flight
         # Store the event loop (passed from main thread or detect current)
         if event_loop:
             self.main_loop = event_loop
@@ -39,7 +42,7 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         try:
             robot_idx = int(robot_id)
             robot_ip = self.config.robot_ip_list[robot_idx]
-            
+
             conn = Go2Connection(
                 robot_ip=robot_ip,
                 robot_num=robot_id,
@@ -49,13 +52,14 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
                 on_video_frame=self.on_video_frame_callback if self.config.enable_video else None,
                 decode_lidar=self.config.decode_lidar,
                 aes_key=self.config.aes_key,
+                on_disconnected=lambda rid=robot_id: self._schedule_reconnect(rid),
             )
-            
+
             self.connections[robot_id] = conn
             await conn.connect()
 
             logger.info(f"Connected to robot {robot_id} at {robot_ip}")
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to robot {robot_id}: {e}")
             raise
@@ -64,7 +68,6 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         """Disconnect from robot"""
         if robot_id in self.connections:
             try:
-                # Используем правильный метод для закрытия WebRTC соединения
                 connection = self.connections[robot_id]
                 if hasattr(connection, 'disconnect'):
                     await connection.disconnect()
@@ -74,6 +77,51 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
                 logger.info(f"Disconnected from robot {robot_id}")
             except Exception as e:
                 logger.error(f"Error disconnecting from robot {robot_id}: {e}")
+
+    # ── reconnect ──────────────────────────────────────────────────────────────
+
+    def _schedule_reconnect(self, robot_id: str) -> None:
+        """Thread-safe: schedule _reconnect_robot on the event loop."""
+        if robot_id in self._reconnecting:
+            return
+        loop = self._get_or_create_event_loop()
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._reconnect_robot(robot_id), loop)
+        else:
+            logger.error(f"Cannot schedule reconnect for robot {robot_id}: no running event loop")
+
+    async def _reconnect_robot(self, robot_id: str) -> None:
+        """Reconnect with exponential backoff. Runs inside the asyncio event loop."""
+        if robot_id in self._reconnecting:
+            return
+        self._reconnecting.add(robot_id)
+        logger.warning(f"Robot {robot_id}: starting reconnect sequence")
+
+        try:
+            # Close and discard the broken connection
+            old_conn = self.connections.pop(robot_id, None)
+            if old_conn:
+                try:
+                    await old_conn.pc.close()
+                except Exception:
+                    pass
+
+            for attempt, delay in enumerate(
+                _RECONNECT_DELAYS + [_RECONNECT_DELAYS[-1]] * 20, start=1
+            ):
+                logger.info(f"Robot {robot_id}: reconnect attempt {attempt} in {delay}s…")
+                await asyncio.sleep(delay)
+                try:
+                    await self.connect(robot_id)
+                    logger.info(f"Robot {robot_id}: reconnected successfully")
+                    return
+                except Exception as e:
+                    logger.warning(f"Robot {robot_id}: reconnect attempt {attempt} failed: {e}")
+
+        finally:
+            self._reconnecting.discard(robot_id)
+
+    # ── send ──────────────────────────────────────────────────────────────────
 
     def set_data_callback(self, callback: Callable[[RobotData], None]) -> None:
         """Set callback for data reception"""
@@ -85,16 +133,13 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
             try:
                 connection = self.connections[robot_id]
                 if hasattr(connection, 'data_channel') and connection.data_channel:
-                    # Use asyncio.run_coroutine_threadsafe to handle cross-thread calls
                     loop = self._get_or_create_event_loop()
                     if loop and loop.is_running():
-                        # Schedule the coroutine in the existing loop
                         asyncio.run_coroutine_threadsafe(
                             self._async_send_command(connection, command),
                             loop
                         )
                     else:
-                        # Fallback to synchronous send
                         connection.data_channel.send(command)
                     logger.debug(f"Command sent to robot {robot_id}: {command[:50]}")
                 else:
@@ -104,17 +149,20 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
 
     def _get_or_create_event_loop(self):
         """Get existing event loop or return the main loop"""
-        # First try to get the current loop
         try:
             return asyncio.get_running_loop()
         except RuntimeError:
-            # If no current loop, return the main loop stored during init
             return self.main_loop
 
     async def _async_send_command(self, connection, command: str):
         """Async wrapper for sending commands"""
         try:
             if hasattr(connection, 'data_channel') and connection.data_channel:
+                if connection.data_channel.readyState != "open":
+                    logger.warning(
+                        f"Data channel not open (state={connection.data_channel.readyState}), dropping command"
+                    )
+                    return
                 connection.data_channel.send(command)
         except Exception as e:
             logger.error(f"Error in async send command: {e}")
@@ -123,9 +171,9 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         """Send movement command to robot"""
         try:
             command = gen_mov_command(
-                round(x, 2), 
-                round(y, 2), 
-                round(z, 2), 
+                round(x, 2),
+                round(y, 2),
+                round(z, 2),
                 self.config.obstacle_avoidance
             )
             self.send_command(robot_id, command)
@@ -137,7 +185,7 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         try:
             stand_up_cmd = gen_command(ROBOT_CMD["StandUp"])
             self.send_command(robot_id, stand_up_cmd)
-            
+
             move_cmd = gen_command(ROBOT_CMD['BalanceStand'])
             self.send_command(robot_id, move_cmd)
         except Exception as e:
@@ -180,14 +228,12 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
                 for topic in RTC_TOPIC.values():
                     conn.data_channel.send(
                         json.dumps({"type": "subscribe", "topic": topic}))
-                # The data channel is confirmed open here (validation just succeeded on it).
-                # disableTrafficSaving must be sent after the channel is open; calling it
-                # from connect() races against ICE and silently no-ops every time.
+                # disableTrafficSaving must be sent after the channel is open
                 asyncio.ensure_future(conn.disableTrafficSaving(True))
 
             if self.on_validated_callback:
                 self.on_validated_callback(robot_id)
-                
+
         except Exception as e:
             logger.error(f"Error in validated callback: {e}")
 
@@ -195,10 +241,7 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
         """Handle incoming data channel messages"""
         try:
             if self.data_callback:
-                # Создаем объект RobotData для передачи в callback
-                # Фактическая обработка будет в RobotDataService
                 robot_data = RobotData(robot_id=robot_id, timestamp=0.0)
-                self.data_callback(msg, robot_id)  # Передаем сырые данные для обработки
-                
+                self.data_callback(msg, robot_id)
         except Exception as e:
-            logger.error(f"Error processing data channel message: {e}") 
+            logger.error(f"Error processing data channel message: {e}")

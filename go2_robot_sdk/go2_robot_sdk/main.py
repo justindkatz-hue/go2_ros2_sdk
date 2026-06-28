@@ -104,12 +104,11 @@ async def main_async():
     finally:
         # Resource cleanup
         try:
-            # Disconnect from robots
             if 'node' in locals() and hasattr(node, 'webrtc_adapter'):
-                for robot_id in node.webrtc_adapter.connections:
+                robot_ids = list(node.webrtc_adapter.connections.keys())
+                for robot_id in robot_ids:
                     await node.webrtc_adapter.disconnect(robot_id)
-            
-            # Close unfinished tasks
+
             tasks = [t for t in asyncio.all_tasks() if not t.done()]
             if tasks:
                 for task in tasks:
@@ -119,7 +118,10 @@ async def main_async():
         except Exception as e:
             print(f"Error during cleanup: {e}")
         finally:
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass  # already shut down by executor
 
 
 def main():

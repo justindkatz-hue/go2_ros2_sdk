@@ -43,6 +43,7 @@ class Go2Connection:
         on_video_frame: Optional[Callable] = None,
         decode_lidar: bool = True,
         aes_key: str = "",
+        on_disconnected: Optional[Callable] = None,
     ):
         self.pc = RTCPeerConnection()
         self.robot_ip = robot_ip
@@ -50,39 +51,54 @@ class Go2Connection:
         self.token = token
         self.robot_validation = "PENDING"
         self.validation_result = "PENDING"
-        
+
         # Callbacks
         self.on_validated = on_validated
         self.on_message = on_message
         self.on_open = on_open
         self.on_video_frame = on_video_frame
+        self.on_disconnected = on_disconnected
         self.decode_lidar = decode_lidar
         self.aes_key = aes_key
-        
+        self._disconnected_fired = False  # ensure callback fires at most once
+
         # Initialize components
         self.http_client = HttpClient(timeout=10.0)
         self.data_decoder = WebRTCDataDecoder(enable_lidar_decoding=decode_lidar)
-        
+
         # Setup data channel
         self.data_channel = self.pc.createDataChannel("data", id=0)
         self.data_channel.on("open", self.on_data_channel_open)
         self.data_channel.on("message", self.on_data_channel_message)
-        
+        self.data_channel.on("close", self.on_data_channel_close)
+
         # Setup peer connection events
         self.pc.on("track", self.on_track)
         self.pc.on("connectionstatechange", self.on_connection_state_change)
-        
+
         # Add video transceiver if video callback provided
         if self.on_video_frame:
             self.pc.addTransceiver("video", direction="recvonly")
     
+    def _fire_disconnected(self) -> None:
+        """Call on_disconnected exactly once regardless of how many events arrive."""
+        if not self._disconnected_fired and self.on_disconnected:
+            self._disconnected_fired = True
+            self.on_disconnected()
+
     def on_connection_state_change(self) -> None:
-        """Handle peer connection state changes"""
-        logger.info(f"Connection state is {self.pc.connectionState}")
-        
-        # Note: Validation is handled after successful WebRTC connection
-        # in the original implementation, not here
+        """Handle peer connection state changes."""
+        state = self.pc.connectionState
+        logger.info(f"Connection state is {state}")
+        if state in ("failed", "closed"):
+            logger.warning(f"Robot {self.robot_num} WebRTC connection {state} — scheduling reconnect")
+            self._fire_disconnected()
     
+    def on_data_channel_close(self) -> None:
+        """Handle data channel close — triggers reconnect."""
+        logger.warning(f"Robot {self.robot_num} data channel closed — scheduling reconnect")
+        self._fire_disconnected()
+
     def on_data_channel_open(self) -> None:
         """Handle data channel open event"""
         logger.info("Data channel is open")
