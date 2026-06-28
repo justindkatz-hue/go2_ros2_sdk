@@ -82,8 +82,9 @@ class RobotControllerNode(Node):
 
     def _webrtc(self, api_id: int):
         msg = WebRtcReq()
-        msg.api_id = api_id
-        msg.topic  = 'rt/api/sport/request'
+        msg.api_id    = api_id
+        msg.topic     = 'rt/api/sport/request'
+        msg.parameter = str(api_id)  # firmware requires non-empty parameter
         self._webrtc_pub.publish(msg)
         self.get_logger().info(f'→ webrtc api_id={api_id}')
 
